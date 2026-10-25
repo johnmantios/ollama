@@ -382,7 +382,9 @@ func (s *Scheduler) processPending(ctx context.Context) {
 				// lands while we wait cannot cancel it.
 				runnerToExpire.refMu.Lock()
 				slog.Debug("resetting model to expire immediately to make room", "runner", runnerToExpire, "refCount", runnerToExpire.refCount)
+				cancelable := runnerToExpire.state == runnerStateLoaded || runnerToExpire.evictionCancelable
 				expireNow := runnerToExpire.requestEvictionLocked()
+				runnerToExpire.evictionCancelable = cancelable
 				runnerToExpire.refMu.Unlock()
 				if expireNow {
 					s.expiredCh <- runnerToExpire
@@ -1422,6 +1424,8 @@ type runnerRef struct {
 	expiresAt       time.Time
 	state           runnerState
 
+	evictionCancelable bool
+
 	// model is atomic so lookups can read it without contending on refMu.
 	model        atomic.Pointer[Model]
 	modelPath    string
@@ -1454,6 +1458,7 @@ func (runner *runnerRef) unload() {
 // caller must send an expiredCh event because the runner is already idle.
 // Callers must hold runner.refMu.
 func (runner *runnerRef) requestEvictionLocked() bool {
+	runner.evictionCancelable = false
 	if runner.state == runnerStateUnloading {
 		return false
 	}
@@ -1531,6 +1536,7 @@ func (s *Scheduler) newExpireTimer(runner *runnerRef, d time.Duration) *time.Tim
 		}
 		runner.state = runnerStateEvictRequested
 		runner.expiresAt = time.Now()
+		runner.evictionCancelable = false
 		s.expiredCh <- runner
 	})
 }
@@ -1540,11 +1546,12 @@ func (s *Scheduler) newExpireTimer(runner *runnerRef, d time.Duration) *time.Tim
 // while requests are still draining: once the runner is idle the unload has
 // already been committed. Callers must hold runner.refMu.
 func (s *Scheduler) cancelEvictionLocked(runner *runnerRef) {
-	if runner.state != runnerStateEvictRequested || runner.refCount == 0 {
+	if runner.state != runnerStateEvictRequested || runner.refCount == 0 || !runner.evictionCancelable {
 		return
 	}
 	slog.Debug("cancelling pending eviction, waiting request went away", "runner", runner, "refCount", runner.refCount)
 	runner.state = runnerStateLoaded
+	runner.evictionCancelable = false
 	runner.expiresAt = time.Time{}
 }
 
